@@ -13,6 +13,8 @@ from api.channelizers import run_channels, CHANNELIZERS
 from psycopg.types.json import Json
 import time, uuid, re, psycopg
 from psycopg.rows import dict_row
+from collections import defaultdict
+from lxml import etree
 
 app = FastAPI()
 
@@ -353,62 +355,284 @@ def to_int(x):
     try: return int(x)
     except: return None
 
-def build_path(scheme: str, ordinal: int, meta: dict) -> str:
-    # e.g., "H.{ordinal:03d}" or "PRV.{meta.chapter}.{ordinal:02d}"
-    return scheme.format(ordinal=ordinal, meta=meta)
+def build_path(
+    scheme: str,
+    *,
+    ordinal: int,
+    meta: dict,
+    kind: str,
+    label: Optional[str] = None,
+) -> str:
+    """Render an ltree path using the supplied format scheme.
+
+    The format context exposes ``ordinal``, ``kind``, ``label`` and ``meta`` so
+    callers can express paths such as ``H.{ordinal:03d}`` or
+    ``PRV.{meta[chapter]}.{ordinal:02d}``.
+    """
+    return scheme.format(
+        ordinal=ordinal,
+        kind=kind,
+        label=(label or ""),
+        meta=meta,
+    )
 
 @app.post("/xml/explode")
 def xml_explode(body: dict):
     domain = body["domain"]
     doc_key = body["doc_key"]
-    rules = body["rules"]
+    rules = body.get("rules", {})
+    unit_rules = rules.get("units") or []
+
+    if not unit_rules:
+        return {"ok": False, "error": "rules.units is required"}
+
+    namespaces = rules.get("namespaces") or None
+    root_path = rules.get("root_path", "/")
+    default_path_scheme = rules.get("path_scheme")
+    path_prefix_default = rules.get("path_prefix")
+    clear_existing = rules.get("clear_existing", True)
+
+    def _xpath(node, expr):
+        return node.xpath(expr, namespaces=namespaces) if namespaces else node.xpath(expr)
+
+    def _coerce_value(val):
+        if val is None:
+            return None
+        if isinstance(val, etree._Element):
+            text = val.text or ""
+            return text.strip() or None
+        if isinstance(val, bytes):
+            return val.decode("utf-8").strip() or None
+        text = str(val).strip()
+        return text or None
+
+    def _collect(node, expr):
+        result = _xpath(node, expr)
+        if isinstance(result, list):
+            out = []
+            for item in result:
+                coerced = _coerce_value(item)
+                if coerced:
+                    out.append(coerced)
+            return out
+        coerced = _coerce_value(result)
+        return [coerced] if coerced else []
+
+    def _first(node, expr):
+        vals = _collect(node, expr)
+        return vals[0] if vals else None
+
+    def _looks_like_xpath(expr: str) -> bool:
+        return expr.startswith((
+            "@",
+            "./",
+            "../",
+            ".//",
+            "//",
+            "normalize-space",
+            "string(",
+            "concat(",
+            "name(",
+        ))
+
+    def _resolve_meta(node, spec):
+        meta = {}
+        for key, expr in (spec or {}).items():
+            val = None
+            if isinstance(expr, str) and _looks_like_xpath(expr):
+                val = _first(node, expr)
+            elif callable(expr):
+                val = expr(node)
+            else:
+                val = expr
+            if val not in (None, ""):
+                meta[key] = val
+        return meta
+
+    def _resolve_label(node, spec):
+        if spec.get("label_path"):
+            label = _first(node, spec["label_path"])
+            if label:
+                return label
+        label_attr = spec.get("label_attr")
+        if label_attr:
+            attr = label_attr[1:] if label_attr.startswith("@") else label_attr
+            label_val = node.get(attr)
+            if label_val:
+                label_val = label_val.strip()
+                if label_val:
+                    return label_val
+        return None
+
+    def _resolve_ordinal(node, spec, counters):
+        ordinal_expr = spec.get("ordinal_path") or spec.get("ordinal")
+        ordinal = None
+        if ordinal_expr is not None:
+            if isinstance(ordinal_expr, str) and _looks_like_xpath(ordinal_expr):
+                ordinal = to_int(_first(node, ordinal_expr))
+            else:
+                ordinal = to_int(ordinal_expr)
+        if ordinal is None:
+            counters[spec["kind"]] += 1
+            ordinal = counters[spec["kind"]]
+        else:
+            counters[spec["kind"]] = max(counters[spec["kind"]], ordinal)
+        return ordinal
+
+    def _resolve_text(node, spec):
+        text_path = spec.get("text_path") or "normalize-space(.)"
+        vals = _collect(node, text_path)
+        if vals:
+            return " ".join(vals)
+        return None
+
+    def _sanitize_token(token: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", token).strip("_")
+        return cleaned or "unit"
+
+    def _normalize_path(path: str) -> str:
+        return ".".join(_sanitize_token(part) for part in path.split(".") if part)
+
+    def _resolve_path(node, spec, ordinal, meta, kind, label):
+        path = None
+        path_scheme = spec.get("path_scheme") or default_path_scheme
+        if path_scheme:
+            try:
+                path = build_path(
+                    path_scheme,
+                    ordinal=ordinal,
+                    meta=meta,
+                    kind=kind,
+                    label=label,
+                )
+            except Exception:
+                # fall back to defaults if formatting fails
+                path = None
+
+        if not path and spec.get("path_attr"):
+            attr = spec["path_attr"]
+            attr = attr[1:] if attr.startswith("@") else attr
+            attr_val = node.get(attr)
+            if attr_val:
+                prefix = spec.get("path_prefix") or path_prefix_default
+                token = _sanitize_token(attr_val)
+                path = f"{prefix}.{token}" if prefix else token
+
+        if not path:
+            prefix = spec.get("path_prefix") or path_prefix_default or kind
+            pad = int(spec.get("path_pad", 3))
+            path = f"{prefix}.{ordinal:0{pad}d}" if prefix else f"{ordinal:0{pad}d}"
+
+        return _normalize_path(path)
+
     with psycopg.connect(DB_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, xml_payload FROM corpus_xml WHERE doc_key=%s AND domain=%s", (doc_key, domain))
+        cur.execute(
+            "SELECT id, xml_payload FROM corpus_xml WHERE doc_key=%s AND domain=%s",
+            (doc_key, domain),
+        )
         row = cur.fetchone()
         if not row:
             return {"ok": False, "error": "corpus_xml not found"}
-        xml = etree.fromstring(bytes(row["xml_payload"], "utf-8")) if isinstance(row["xml_payload"], str) else etree.fromstring(row["xml_payload"])
-        root = xml.xpath(rules.get("root_path","/"))[0]
 
-        # helper: upsert unit, return id
+        payload = row["xml_payload"]
+        if isinstance(payload, str):
+            xml_bytes = payload.encode("utf-8")
+        elif isinstance(payload, memoryview):
+            xml_bytes = payload.tobytes()
+        else:
+            xml_bytes = bytes(payload)
+
+        try:
+            xml_root = etree.fromstring(xml_bytes)
+        except etree.XMLSyntaxError as exc:
+            return {"ok": False, "error": f"invalid xml: {exc}"}
+
+        roots = _xpath(xml_root, root_path)
+        if not roots:
+            # allow the document root itself if the path resolves to the root
+            if root_path in ("/", ".", "./"):
+                roots = [xml_root]
+            else:
+                return {"ok": False, "error": f"root_path '{root_path}' yielded no nodes"}
+
+        if clear_existing:
+            cur.execute(
+                "DELETE FROM doc_unit WHERE domain=%s AND doc_key=%s",
+                (domain, doc_key),
+            )
+
+        counters = defaultdict(int)
+        ids_by_node = {}
+        kinds_by_node = {}
+        inserted_by_kind = defaultdict(int)
+
         def insert_unit(kind, label, path, ordinal, text, meta, parent_id=None):
-            cur.execute("""
-              INSERT INTO doc_unit (domain, doc_key, kind, label, path, ordinal, text, meta, parent_id)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
-            """, (domain, doc_key, kind, label, path, ordinal, text, Json(meta), parent_id))
+            cur.execute(
+                """
+                  INSERT INTO doc_unit (domain, doc_key, kind, label, path, ordinal, text, meta, parent_id)
+                  VALUES (%s,%s,%s,%s,%s::ltree,%s,%s,%s,%s)
+                  RETURNING id
+                """,
+                (domain, doc_key, kind, label, path, ordinal, text, Json(meta or {}), parent_id),
+            )
+            inserted_by_kind[kind] += 1
             return cur.fetchone()["id"]
 
-        ids_by_xpathnode = {}
+        for root in roots:
+            for spec in unit_rules:
+                kind = spec["kind"]
+                nodes = _xpath(root, spec["path"])
+                for node in nodes:
+                    label = _resolve_label(node, spec)
+                    meta = _resolve_meta(node, spec.get("meta"))
+                    ordinal = _resolve_ordinal(node, spec, counters)
+                    text = _resolve_text(node, spec)
+                    path = _resolve_path(node, spec, ordinal, meta, kind, label)
 
-        # pass 1: create primary units
-        for u in rules["units"]:
-            for node in root.xpath(u["path"]):
-                label = (node.get(u.get("label_attr","")) or "").strip() or None
-                ordinal = to_int(node.xpath(u["ordinal"])[0] if u.get("ordinal") else None)
-                text = " ".join(node.xpath(u.get("text_path","./text()"))) if u.get("text_path") else None
-                meta = {}
-                for k,v in (u.get("meta") or {}).items():
-                    meta[k] = (node.xpath(v)[0] if v.startswith("@") or v.startswith("./") or v.startswith("../") else v)
+                    parent_id = None
+                    if spec.get("parent_xpath"):
+                        for candidate in _xpath(node, spec["parent_xpath"]):
+                            parent_id = ids_by_node.get(candidate)
+                            if parent_id:
+                                break
+                    if parent_id is None and spec.get("parent_kind"):
+                        parent_kinds = spec["parent_kind"]
+                        if isinstance(parent_kinds, str):
+                            parent_kinds = [parent_kinds]
+                        for ancestor in node.iterancestors():
+                            anc_id = ids_by_node.get(ancestor)
+                            if anc_id and kinds_by_node.get(ancestor) in parent_kinds:
+                                parent_id = anc_id
+                                break
+                    if parent_id is None and spec.get("inherit_parent"):
+                        ancestor = next(iter(node.iterancestors()), None)
+                        if ancestor is not None:
+                            parent_id = ids_by_node.get(ancestor)
 
-                # build ltree path
-                if "path_scheme" in rules:
-                    path = build_path(rules["path_scheme"], ordinal or 0, meta)
-                else:
-                    # fallback: KIND.ordinal
-                    path = f"{u['kind']}.{ordinal or 0}"
+                    unit_id = insert_unit(kind, label, path, ordinal, text, meta, parent_id)
+                    ids_by_node[node] = unit_id
+                    kinds_by_node[node] = kind
 
-                unit_id = insert_unit(u["kind"], label, path, ordinal, text, meta, parent_id=None)
-                ids_by_xpathnode[node] = unit_id
-
-                # optional sentence splitting for this unit
-                for child in (rules.get("children",{}).get(u["kind"], [])):
-                    if child.get("split") == "sentence" and text:
-                        sentences = sentence_split(text)  # your splitter
-                        for j, sent in enumerate(sentences, start=1):
-                            insert_unit(child["kind"], f"{label or u['kind']}-{j}", f"{path}.{j:03d}", j, sent, {}, parent_id=unit_id)
+                    if spec.get("children"):
+                        for child in spec["children"]:
+                            if child.get("split") == "sentence" and text:
+                                sentences = sentence_split(text)
+                                for j, sent in enumerate(sentences, start=1):
+                                    child_path = f"{path}.{j:03d}"
+                                    insert_unit(
+                                        child["kind"],
+                                        f"{label or kind}-{j}",
+                                        _normalize_path(child_path),
+                                        j,
+                                        sent,
+                                        {},
+                                        parent_id=unit_id,
+                                    )
 
         conn.commit()
-    return {"ok": True}
+
+    total = sum(inserted_by_kind.values())
+    return {"ok": True, "inserted": total, "by_kind": dict(inserted_by_kind)}
 
 # --- helper: safe int ---
 def _to_int(x):
