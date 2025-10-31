@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: handey
+  session_id: H500
+  channel: lexico_semantic
+  text: "I promised to change, yet the mirror filed an appeal. So I switched lawyers and smiled at myself."

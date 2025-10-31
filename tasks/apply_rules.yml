@@ -1,0 +1,11 @@
+type: shell
+cmd: |
+  set -e
+  echo "== recompute =="
+  psql "postgresql://pst:pstpass@localhost:5532/pst" -f /mnt/mnemosyne/pst/db/recompute_move_edge.sql
+  echo "== rebuild curvature =="
+  psql "postgresql://pst:pstpass@localhost:5532/pst" -f /mnt/mnemosyne/pst/db/curvature_multi.sql
+  echo "== promote truths =="
+  psql "postgresql://pst:pstpass@localhost:5532/pst" -f /mnt/mnemosyne/pst/db/rule_cross_domain_curvature.sql
+  echo "== recent truths =="
+  psql "postgresql://pst:pstpass@localhost:5532/pst" -c "SELECT id, LEFT(claim,80)||'…' AS claim, ROUND(confidence::numeric,3) AS conf FROM truth ORDER BY id DESC LIMIT 5;"

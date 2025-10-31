@@ -1,0 +1,7 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_unit
+data:
+  unit_path: "RA.*"
+  depth: subtitle
+  channels:

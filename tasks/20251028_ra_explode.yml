@@ -1,0 +1,10 @@
+type: api
+method: POST
+url: http://localhost:8090/jsonl/explode
+data:
+  domain: raising_arizona
+  doc_key: RaisingArizona_1987_panel_v2_6
+  rules:
+    path_prefix: "RA"
+    scene_gap_seconds: 45
+    boundary_shot_regex: "^(INT\\.|EXT\\.|FADE|TITLE IS SUPERED)"

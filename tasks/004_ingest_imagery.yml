@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: proverbs
+  session_id: P300
+  channel: imagery
+  text: "A patient river cuts stone; a hot wind carries only dust."

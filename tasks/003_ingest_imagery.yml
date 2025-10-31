@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: handey
+  session_id: H300
+  channel: imagery
+  text: "The candle bragged to the sun, but its wax confessed the truth."

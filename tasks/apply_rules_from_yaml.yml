@@ -1,0 +1,5 @@
+type: rules
+rules:
+  - name: xdomain-curv
+    when: { min_weight: 0.30 }
+    then: { sql: "/mnt/mnemosyne/pst/db/rule_cross_domain_curvature.sql" }

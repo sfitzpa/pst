@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: handey
+  session_id: H301
+  channel: lexico_semantic
+  text: "I tried to improve myself, yet my old shoes kept perfect attendance."

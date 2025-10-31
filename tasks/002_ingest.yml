@@ -1,0 +1,7 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: proverbs
+  session_id: P101
+  text: "The patient river carves the mountain, but the hasty drop dries in dust."

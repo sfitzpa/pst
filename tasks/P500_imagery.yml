@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: proverbs
+  session_id: P500
+  channel: imagery
+  text: "A small lamp humbles the room, but the sun teaches silence. Then the river sculpts stone."

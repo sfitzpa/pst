@@ -1,0 +1,286 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+import os, math
+from datetime import datetime
+import psycopg
+from psycopg.rows import dict_row
+from typing import List, Tuple
+import re
+import json
+from psycopg.types.json import Json   
+
+from fastapi import Body
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# If you want to be strict, list your exact origins instead of ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # or ["http://pi-core:8090","http://localhost:8090"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_URL = os.environ["DATABASE_URL"]
+
+class ConceptIn(BaseModel):
+    key: str
+    label: str | None = None
+    embedding: list[float]  # 1536-d by default
+
+class ObservationIn(BaseModel):
+    session_id: str
+    sequence: list[str]     # list of concept.keys in order
+    outcome: str = "success"
+    context: dict | None = None
+
+EMB_DIM = 3  # or 3 if you shrank the DB for the demo -- was 1536
+
+def to_dim(x, d=EMB_DIM):
+    """Pad/truncate any iterable to dimension d."""
+    if isinstance(x, (list, tuple)):
+        v = list(x)
+    else:
+        # psycopg may return the pgvector as text like "[0.1, 0.2, 0.3]"
+        s = str(x).strip().lstrip("[({").rstrip("])}")
+        parts = [p for p in re.split(r"[,\s]+", s) if p]
+        v = [float(p) for p in parts]
+    if len(v) >= d:
+        return v[:d]
+    return v + [0.0] * (d - len(v))
+
+def vec_sub(b, a, d=EMB_DIM):
+    """Compute b - a with padding/truncation."""
+    A = to_dim(a, d)
+    B = to_dim(b, d)
+    return [bj - aj for aj, bj in zip(A, B)]
+
+		
+# def vec_sub(b, a): return [bi - ai for ai, bi in zip(a, b, strict=True)]
+
+@app.get("/health")
+def health():
+    try:
+        with psycopg.connect(DB_URL) as conn:
+            conn.execute("select 1")
+        return {"status":"ok"}
+    except Exception as e:
+        return {"status":"db-fail","error":str(e)}
+
+@app.get("/curvature/top")
+def curvature_top(domain: str = "*", k: int = 20):
+    q = """
+    SELECT domain, ch_a, ch_b, COUNT(*) AS n, AVG(weight) AS w
+    FROM curvature_multi
+    WHERE (%s='*' OR domain=%s)
+    GROUP BY 1,2,3
+    ORDER BY w DESC NULLS LAST, n DESC
+    LIMIT %s;
+    """
+    with psycopg.connect(DB_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
+        cur.execute(q, (domain, domain, k))
+        return [dict(r) for r in cur.fetchall()]
+
+@app.get("/truths/recent")
+def truths_recent(k: int = 20):
+    with psycopg.connect(DB_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
+        cur.execute("""
+          SELECT id, claim, COALESCE(method,'') AS method,
+                 ROUND(confidence::numeric,3) AS confidence, source, evidence
+          FROM truth
+          ORDER BY id DESC
+          LIMIT %s
+        """, (k,))
+        return [dict(r) for r in cur.fetchall()]
+        
+@app.post("/concepts")
+def upsert_concept(c: ConceptIn):
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM concept WHERE key=%s", (c.key,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE concept SET label=%s, embedding=%s WHERE id=%s",
+                            (c.label, to_dim(c.embedding), row["id"]))
+                cid = row["id"]
+            else:
+                cur.execute("INSERT INTO concept (key, label, embedding) VALUES (%s,%s,%s) RETURNING id",
+                            (c.key, c.label, to_dim(c.embedding)))
+                cid = cur.fetchone()["id"]
+            conn.commit()
+    return {"id": cid, "key": c.key}
+
+@app.post("/observe")
+def observe(obs: ObservationIn):
+    with psycopg.connect(DB_URL) as conn, conn.cursor() as cur:
+        # write raw sequence
+        for i, k in enumerate(obs.sequence):
+            cur.execute("SELECT id, embedding FROM concept WHERE key=%s", (k,))
+            row = cur.fetchone()
+            if not row: raise ValueError(f"unknown concept key {k}")
+            cur.execute("INSERT INTO observation (session_id, seq, concept_id, outcome) VALUES (%s,%s,%s,%s)",
+                        (obs.session_id, i, row[0], obs.outcome))
+        # accumulate transitions and weights
+        for i in range(len(obs.sequence)-1):
+            a, b = obs.sequence[i], obs.sequence[i+1]
+            cur.execute("SELECT id, embedding FROM concept WHERE key=%s", (a,))
+            sa, ea = cur.fetchone()
+            cur.execute("SELECT id, embedding FROM concept WHERE key=%s", (b,))
+            sb, eb = cur.fetchone()
+
+            # old and has str-str error:: delta = [eb[j]-ea[j] for j in range(len(eb))]
+            # upsert trajectory
+			# New way where we to_dim the values:: ea, eb come back as strings or lists; normalize then compute delta
+            delta = vec_sub(eb, ea, EMB_DIM)
+
+            cur.execute("""
+              INSERT INTO trajectory (source_id, target_id, delta, weight, freq, last_seen, context)
+              VALUES (%s,%s,%s, 0.0, 1, now(), %s)
+              ON CONFLICT DO NOTHING
+            """, (sa, sb, to_dim(delta, EMB_DIM), None))
+
+            # update weight/freq
+            cur.execute("""
+              UPDATE trajectory
+              SET freq = freq + 1,
+                  weight = 1 - exp(-0.15 * (freq + 1)),
+                  last_seen = now()
+              WHERE source_id=%s AND target_id=%s
+            """, (sa, sb))
+        conn.commit()
+    return {"status": "ok"}
+
+@app.get("/predict/next/{key}")
+def predict_next(key: str, k: int = 5):
+    with psycopg.connect(DB_URL) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, embedding FROM concept WHERE key=%s", (key,))
+        row = cur.fetchone()
+        if not row: return {"predictions": []}
+        source_id = row["id"]
+        # naive: return top by weight/freq (fast baseline)
+        cur.execute("""
+          SELECT t.target_id, t.weight, t.freq, c.key AS target_key
+          FROM trajectory t JOIN concept c ON c.id = t.target_id
+          WHERE t.source_id = %s
+          ORDER BY t.weight DESC, t.freq DESC
+          LIMIT %s
+        """, (source_id, k))
+        return {"predictions": list(cur.fetchall())}
+
+
+SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
+
+def sentence_split(x: str) -> List[str]:
+    return [s.strip() for s in SENT_SPLIT.split(x.strip()) if s.strip()]
+
+
+def pad384(xs: List[float]) -> List[float]:
+    if len(xs) >= 384: return xs[:384]
+    return xs + [0.0]*(384-len(xs))
+
+def rhetoric_features(s: str) -> List[float]:
+    t = s.lower()
+    feats = [
+        1.0 if re.search(r"\b(but|yet|however)\b", t) else 0.0,  # contrast
+        1.0 if re.search(r"\b(so|therefore|thus)\b", t) else 0.0,  # causal
+        1.0 if re.search(r"\bif\b", t) else 0.0,                  # conditional
+        1.0 if re.search(r"\b(no|not|never|none)\b", t) else 0.0, # negation
+        1.0 if re.match(r"^[a-z]+(?:\s+[a-z]+){0,2}\b", t) and t.endswith("!") else 0.0,  # crude imperative-ish
+        1.0 if "?" in t else 0.0,                                  # question
+        1.0 if re.search(r"\bi\b", t) and re.search(r"\byou\b", t) else 0.0, # pronoun shift
+        min(1.0, t.count(",")/3.0),                                # commas
+        min(1.0, sum(c in ";:" for c in t)/2.0),                   # ; :
+        min(1.0, sum(c in "'\"" for c in t)/2.0),                  # quotes
+        min(1.0, len(t)/160.0),                                    # length proxy
+        1.0 if re.search(r"\b(and|or)\b.*\b(and|or)\b", t) else 0.0 # parallel-ish
+    ]
+    # pad to 384
+    return pad384(feats)
+
+# --- Imagery channel: tiny buckets, normalized to 384 with pad ---
+IMAGERY_BUCKETS = {
+    "light":  ["light","shine","bright","candle","lamp","sun"],
+    "dark":   ["dark","shadow","night","gloom","dim","fog"],
+    "body":   ["hand","heart","mouth","eyes","foot","back","bone"],
+    "nature": ["river","tree","seed","harvest","wind","stone","mountain"],
+    "money":  ["gold","silver","coin","wealth","poor","debt","price"],
+    "family": ["father","mother","son","daughter","friend","neighbor"],
+}
+def imagery_features(s: str) -> list[float]:
+    t = s.lower()
+    vec = []
+    for k, words in IMAGERY_BUCKETS.items():
+        vec.append(sum(t.count(w) for w in words))
+    # L2 normalize small vector
+    norm = sum(x*x for x in vec) ** 0.5 or 1.0
+    vec = [x / norm for x in vec]
+    return vec + [0.0] * (384 - len(vec))
+
+# --- Lexico-semantic channel (deterministic 384-d stub; CPU-cheap) ---
+def lexsem_stub(s: str) -> list[float]:
+    # stable pseudo-random from text hash, no numpy required
+    import hashlib, struct
+    h = hashlib.blake2b(s.encode("utf-8"), digest_size=64).digest()
+    vals = []
+    # expand digest to 384 floats in [0,1)
+    while len(vals) < 384:
+        for i in range(0, len(h), 8):
+            vals.append(abs(struct.unpack(">q", h[i:i+8])[0]) % 10_000 / 10_000.0)
+            if len(vals) == 384: break
+        h = hashlib.blake2b(h, digest_size=64).digest()  # re-mix
+    return vals
+
+class IngestBody(BaseModel):
+    domain: str
+    session_id: str
+    text: str
+    channel: str | None = "rhetoric"
+
+@app.post("/ingest_text")
+def ingest_text(body: IngestBody):
+    sents = sentence_split(body.text)
+    if not sents:
+        return {"ok": True, "sentences": 0, "channel": body.channel}
+
+    with psycopg.connect(DB_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
+        move_ids = []
+        for i, s in enumerate(sents):
+            # feats = rhetoric_features(s)
+            if body.channel == "rhetoric":
+                feats = rhetoric_features(s)
+            elif body.channel == "imagery":
+                feats = imagery_features(s)
+            elif body.channel == "lexico_semantic":
+                feats = lexsem_stub(s)
+            else:
+                feats = [0.0]*384
+            
+            cur.execute("""
+              INSERT INTO move (session_id, domain, channel, span, features)
+              VALUES (%s,%s,%s,%s::jsonb, (%s)::float8[]::vector(384))
+              RETURNING id
+            """, (
+                body.session_id,
+                body.domain,
+                body.channel,
+                json.dumps({"sent": i}),   # convert Python dict to JSON text
+                feats
+            ))
+            move_ids.append(cur.fetchone()["id"])
+
+        for i in range(len(move_ids)-1):
+            a, b = move_ids[i], move_ids[i+1]
+            cur.execute("""
+                INSERT INTO move_edge (source_move, target_move, channel, delta, weight, freq, last_seen, context)
+                SELECT %s, %s, %s,
+                       (fb.features - fa.features),
+                       0.0, 1, now(), %s
+                FROM (SELECT features FROM move WHERE id=%s) fa,
+                     (SELECT features FROM move WHERE id=%s) fb
+                ON CONFLICT DO NOTHING
+            """, (a, b, body.channel, Json({"domain": body.domain}), a, b))
+        conn.commit()
+
+    return {"ok": True, "sentences": len(sents), "channel": body.channel}

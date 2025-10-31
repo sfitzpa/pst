@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+db/init/*.sql~       # editor temp files
+volumes/
+backups/

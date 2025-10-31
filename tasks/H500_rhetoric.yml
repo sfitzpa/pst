@@ -1,0 +1,8 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: handey
+  session_id: H500
+  channel: rhetoric
+  text: "I tried to be profound, but my shoelaces tied themselves together. So I bowed and called it wisdom."

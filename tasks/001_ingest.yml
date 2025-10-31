@@ -1,0 +1,7 @@
+type: api
+method: POST
+url: http://localhost:8090/ingest_text
+data:
+  domain: handey
+  session_id: H201
+  text: "I asked life for a sign, but it mailed me a mirror. So I learned to read faces."
