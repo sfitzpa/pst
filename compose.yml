@@ -1,0 +1,54 @@
+name: pst
+
+networks:
+  pst_net:
+    name: pst_net
+
+services:
+  postgres:
+    image: ankane/pgvector:v0.5.1            # pin; matches what you observed
+    container_name: pst-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pst
+      POSTGRES_PASSWORD: pstpass
+      POSTGRES_DB: pst
+    volumes:
+      - ../db/init:/docker-entrypoint-initdb.d:ro
+      - /mnt/mnemosyne/stacks/pst_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5532:5432"                          # you can remove this and use SSH tunnel instead
+    networks: [pst_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pst -d pst"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  api:
+    build:
+      context: ../api
+    image: local/pst-api:dev
+    container_name: pst-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://pst:pstpass@postgres:5432/pst
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    networks: [pst_net]
+
+  worker:
+    build:
+      context: ../worker
+    image: local/pst-worker:dev
+    container_name: pst-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://pst:pstpass@postgres:5432/pst
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [pst_net]
