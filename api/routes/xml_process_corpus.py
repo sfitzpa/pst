@@ -1,8 +1,14 @@
 # api/routes/xml_process_corpus.py
 from fastapi import APIRouter, HTTPException, Body
 import asyncpg, os
-from typing import Optional, List, Dict, Any
-from api.app import parse_xml_bytes, write_moves, upsert_doc_unit, ensure_pst_tables  # import your existing helpers
+from typing import Optional, Dict, Any
+
+from api.services.corpus_processing import (
+    ensure_pst_tables,
+    parse_xml_bytes,
+    upsert_doc_unit,
+    write_moves,
+)
 
 router = APIRouter()
 POOL = None
@@ -26,13 +32,33 @@ async def process_corpus(
     if not corpus_id and not domain:
         raise HTTPException(400, "Provide corpus_id or domain.")
     async with (await pool()).acquire() as con:
-        # shape: id, domain, xml, session_hint (if you have it)
+        # shape: id, domain, doc_key, xml_payload, session_hint
         if corpus_id:
-            rows = await con.fetch("""SELECT id, domain, xml, COALESCE(session_hint,'') AS sh
-                                      FROM corpus_xml WHERE id=$1""", corpus_id)
+            rows = await con.fetch(
+                """
+                SELECT id,
+                       domain,
+                       doc_key,
+                       xml_payload,
+                       COALESCE(meta->>'session_hint', '') AS session_hint
+                FROM corpus_xml
+                WHERE id=$1
+                """,
+                corpus_id,
+            )
         else:
-            rows = await con.fetch("""SELECT id, domain, xml, COALESCE(session_hint,'') AS sh
-                                      FROM corpus_xml WHERE domain=$1""", domain)
+            rows = await con.fetch(
+                """
+                SELECT id,
+                       domain,
+                       doc_key,
+                       xml_payload,
+                       COALESCE(meta->>'session_hint', '') AS session_hint
+                FROM corpus_xml
+                WHERE domain=$1
+                """,
+                domain,
+            )
 
         if not rows:
             raise HTTPException(404, "No matching corpus_xml rows.")
@@ -40,12 +66,18 @@ async def process_corpus(
 
         totals = 0
         for r in rows:
-            xml_bytes = r["xml"] if isinstance(r["xml"], (bytes, bytearray)) else bytes(r["xml"], "utf-8")
+            payload = r["xml_payload"]
+            if isinstance(payload, (bytes, bytearray, memoryview)):
+                xml_bytes = bytes(payload)
+            else:
+                xml_bytes = str(payload).encode("utf-8")
             dom = r["domain"]
-            units = parse_xml_bytes(xml_bytes, dom)
+            doc_key = r["doc_key"]
+            units = parse_xml_bytes(xml_bytes, dom, doc_key)
             if not units:
                 continue
-            session_id = f"{session_prefix}_{dom}_{r['id']}"
+            session_hint = r["session_hint"] or doc_key
+            session_id = f"{session_prefix}_{session_hint}"
             async with con.transaction():
                 await upsert_doc_unit(con, session_id, dom, units)
                 await write_moves(con, session_id, dom, units)

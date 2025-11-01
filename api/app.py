@@ -7,16 +7,19 @@ from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 
 # app.py (snippets)
+from .routes.xml_process_corpus import router as corpus_router
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from api.channelizers import run_channels, CHANNELIZERS
 from psycopg.types.json import Json
-import time, uuid, re, psycopg
+import re, psycopg
 from psycopg.rows import dict_row
 from collections import defaultdict
 from lxml import etree
 
+from api.services.move_ingest import default_session_id, ingest_one_text, sentence_split
+
 app = FastAPI()
+app.include_router(corpus_router)
 
 # If you want to be strict, list your exact origins instead of ["*"]
 app.add_middleware(
@@ -173,86 +176,11 @@ def predict_next(key: str, k: int = 5):
         """, (source_id, k))
         return {"predictions": list(cur.fetchall())}
 
-	
-SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
-def sentence_split(x: str) -> List[str]:
-    return [s.strip()] if (x := x.strip()) and not SENT_SPLIT.search(x) else \
-           [s.strip() for s in SENT_SPLIT.split(x) if s.strip()]
-
 class IngestBody(BaseModel):
     domain: str
     session_id: Optional[str] = None
     text: str
     channels: Optional[List[str]] = None  # None → all registered channels
-
-def default_session_id(domain: str) -> str:
-    return f"{domain}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-
-# --- helper: ingest_one_text -----------------------------------------------
-# Purpose: run selected channels on `text`, insert one move per channel,
-# and (optionally) chain edges to the previous move in this stream.
-
-def ingest_one_text(
-    conn,
-    text: str,
-    *,
-    session_id: str,
-    domain: str,
-    used_channels: Optional[List[str]] = None,   # None => all enabled
-    span: Optional[dict] = None,                 # e.g., {"sent": i} or {"unit_path": "..."}
-    prev_by_channel: Optional[Dict[str, int]] = None,  # carryover for chaining
-) -> Dict[str, any]:
-    """
-    Returns:
-      {
-        "move_for_channel": {channel: move_id, ...},
-        "prev_by_channel": {channel: move_id, ...},   # updated
-        "moves": int,
-        "edges": int
-      }
-    """
-    if not text or not text.strip():
-        return {"move_for_channel": {}, "prev_by_channel": prev_by_channel or {}, "moves": 0, "edges": 0}
-
-    ch_map = run_channels(text, used_channels)   # {channel: np.array/list[384]}
-    move_for_channel: Dict[str, int] = {}
-    edges_made = 0
-    span = span or {}
-    prev_by_channel = dict(prev_by_channel or {})
-
-    with conn.cursor() as cur:
-        for ch, vec in ch_map.items():
-            # Insert the move row with typed 384-d vector and span/context
-            cur.execute("""
-                INSERT INTO move (session_id, domain, channel, span, features)
-                VALUES (%s,%s,%s,%s, (%s)::float8[]::vector(384))
-                RETURNING id
-            """, (session_id, domain, ch, Json(span), vec))
-            mid = cur.fetchone()["id"]
-            move_for_channel[ch] = mid
-
-            # Build within-channel chain (prev -> curr)
-            prev = prev_by_channel.get(ch)
-            if prev:
-                cur.execute("""
-                    INSERT INTO move_edge (source_move, target_move, channel, delta, weight, freq, last_seen, context)
-                    SELECT %s, %s, %s,
-                           (m2.features - m1.features),
-                           0.0, 1, now(), %s
-                    FROM (SELECT features FROM move WHERE id=%s) m1,
-                         (SELECT features FROM move WHERE id=%s) m2
-                    ON CONFLICT DO NOTHING
-                """, (prev, mid, ch, Json({"domain": domain, "session_id": session_id}), prev, mid))
-                edges_made += 1
-
-            prev_by_channel[ch] = mid
-
-    return {
-        "move_for_channel": move_for_channel,
-        "prev_by_channel": prev_by_channel,
-        "moves": len(move_for_channel),
-        "edges": edges_made,
-    }
 
 @app.post("/ingest_text")
 def ingest_text(body: IngestBody):
@@ -260,6 +188,7 @@ def ingest_text(body: IngestBody):
     if not sents:
         return {"ok": True, "sentences": 0, "channel": body.channel}
 
+    session_id = body.session_id or default_session_id(body.domain)
     used_channels = None if (body.channel in (None, "", "all")) else [body.channel]
 
     with psycopg.connect(DB_URL, row_factory=dict_row) as conn:
@@ -271,7 +200,7 @@ def ingest_text(body: IngestBody):
             out = ingest_one_text(
                 conn,
                 sent,
-                session_id=body.session_id,
+                session_id=session_id,
                 domain=body.domain,
                 used_channels=used_channels,
                 span={"sent": i, "ingest_source": "ingest_text"},
@@ -286,7 +215,7 @@ def ingest_text(body: IngestBody):
     return {
         "ok": True,
         "domain": body.domain,
-        "session_id": sid,
+        "session_id": session_id,
         "sentences": len(sents),
         "channels": used_channels,
         "moves": total_moves,
@@ -795,4 +724,3 @@ def jsonl_explode(body: dict):
         conn.commit()
 
     return {"ok": True, "scenes": scene_idx}
-
